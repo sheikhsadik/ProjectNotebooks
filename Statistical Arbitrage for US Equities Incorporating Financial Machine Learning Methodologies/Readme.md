@@ -9,3 +9,7 @@ I conduct my analysis on the S&P500 constituents downloaded from CRSP, starting 
 3) Next, fit a primary model based on a given threshold rule. (I would like to investigate whether deep learning can add value here)
 4) Next, fit an ensemble of meta models to assess the probability of the pair's profitability
 5) Use the meta model as a risk management overlay on top of the primary model. 
+
+![image](https://user-images.githubusercontent.com/34893136/124941913-2a916100-dfd9-11eb-8a54-df8980667d12.png)
+
+![image](https://user-images.githubusercontent.com/34893136/124941999-3aa94080-dfd9-11eb-98eb-85a652b5ef2b.png)
