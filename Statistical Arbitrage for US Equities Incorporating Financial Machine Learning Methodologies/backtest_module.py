@@ -3,14 +3,16 @@ import pandas as pd
 from StatArb.pair_select_module import PairSelect
 from StatArb.estimators_module import Estimators
 import Backtester.SignalHelper as sh
+from numba import jit
 
 class Backtest:
 
     def __init__(self, df,
-                 train_lkbk=int(252*5), test_lkbk=int(252*2),
+                 train_lkbk=int(252*5), test_lkbk=int(252/2),
                  min_periods=int(252*3), opt_k=5,
                  hr_lkbk=int(252), spread_lkbk=int(21*3),
-                 corr_thresh=0.10, hr_method='tls', cv_splits=4):
+                 signal_lag = 3, corr_thresh=0.10,
+                 hr_method='ols', cv_splits=4):
 
         self.df = df
         self.train_lkbk = train_lkbk
@@ -19,9 +21,10 @@ class Backtest:
         self.opt_k = opt_k
         self.hr_lkbk = hr_lkbk
         self.spread_lkbk = spread_lkbk
-        self.cv_splits = cv_splits
+        self.signal_lag = signal_lag
         self.corr_thresh = corr_thresh
         self.hr_method = hr_method
+        self.cv_splits = cv_splits
 
         self.pair_select = None
         self.pairs_opt = None
@@ -35,38 +38,56 @@ class Backtest:
                                       self.spread_lkbk)
         self.pair_select.form_pairs(self.corr_thresh, self.hr_method)
         self.pairs_opt = self.pair_select.selected_pairs
+        print('Pair Selection Process Complete...')
 
-        return self
 
-    def get_pair_strat(self, meta_labelling=True):
-
+    def get_pairs_strat(self, meta_labelling=True):
+        print('Iterating through Pairs...')
         for pair_ids in self.pairs_opt:
 
             pair_str = '{}_{}'.format(pair_ids[0], pair_ids[1])
             pair_df = self.df[pair_ids].apply(lambda x: 1 + x).cumprod().\
                           iloc[-self.test_lkbk:].apply(np.log)
 
-            z_spreads = self.pair_select.z_spreads_dict[pair_str]
+            z_spreads = self.pair_select.z_spreads_dict[pair_str].shift(self.signal_lag)
             h_ratio = self.pair_select.hedge_weights_dict[pair_str].\
-                          iloc[-self.test_lkbk:]
+                          shift(self.signal_lag).iloc[-self.test_lkbk:]
             if meta_labelling:
+                # print('Fitting Meta Labelling Classifiers...')
                 pair_spreads = self.pair_select.spreads_dict[pair_str].to_frame('spread')
-                meta_features = self.get_meta_features(pair_spreads, z_spreads)
-                meta_labels = self.get_meta_labels(meta_features,
+                meta_features = Backtest.get_meta_features(pair_spreads, z_spreads, self.signal_lag)
+                meta_labels = Backtest.get_meta_labels(meta_features,
                                                    self.test_lkbk,
                                                    n_splits=self.cv_splits)
                 meta_labels = meta_labels.to_frame('meta_label')
             else:
                 meta_labels = pd.DataFrame(1, index=h_ratio.index,
                                            columns=['meta_label'])
-
-            self.strat_dict[pair_str] = self.get_strat_ret(pair_df,
+            # print('Calculating Trading Period Performance...')
+            self.strat_dict[pair_str] = Backtest.get_strat_ret(pair_df,
                                                            z_spreads.iloc[-self.test_lkbk:],
                                                            meta_labels,
                                                            h_ratio)
-        return self
 
-    def score_to_status(self, z_spreads, dev=1.5, stop_long=0.5, stop_short=0.75):
+    @staticmethod
+    @jit(nopython=True)
+    def get_trade_status(signal, stop_signal):
+        status = [0]
+        for ix in range(1, len(signal)):
+            if (status[ix - 1] == 0) | \
+                    ((status[ix - 1] == 0) & (stop_signal[ix - 1] == 1)):
+                status.append(signal[ix])
+            elif (status[ix - 1] != 0) & (stop_signal[ix] == 1):
+                status.append(0)
+            elif (status[ix - 1] != 0) & (signal[ix] != 0):
+                status.append(signal[ix])
+            else:
+                status.append(status[ix - 1])
+
+        return status
+
+    @staticmethod
+    def score_to_status(z_spreads, dev=1.5, stop_long=0.5, stop_short=0.75):
 
         sig_df = z_spreads.to_frame('z_spreads')
         sig_df['signal'] = 0
@@ -76,16 +97,18 @@ class Backtest:
                                     sig_df['signal'])
         sig_df['stop_signal'] = 0
         sig_df['status'] = 0
-        stop_idx = (sig_df['z_spreads'] > - stop_long) & (sig_df['z_spreads'] < stop_short)
+        stop_idx = (sig_df['z_spreads'] > - stop_long) & \
+                   (sig_df['z_spreads'] < stop_short)
         sig_df['stop_signal'] = np.where(stop_idx, 1, sig_df['stop_signal'])
 
         signal = sig_df['signal'].values
         stop_signal = sig_df['stop_signal'].values
-        sig_df['status'] = sh.get_trade_status(signal, stop_signal)
+        sig_df['status'] = Backtest.get_trade_status(signal, stop_signal)
 
         return sig_df['status']
 
-    def get_meta_features(self, pair_spreads, z_spreads):
+    @staticmethod
+    def get_meta_features(pair_spreads, z_spreads, signal_lag=1):
 
         cols = []
         params_dict = {
@@ -131,7 +154,7 @@ class Backtest:
 
         meta_df = pd.concat([vol_df, skew_df,
                              kurt_df, hurst_df,
-                             acf_df], axis=1).shift(1)
+                             acf_df], axis=1).shift(signal_lag)
 
         for l1, l2 in meta_df.columns: cols.append('{}_{}'.format(l1, l2))
         meta_df = meta_df.droplevel(axis=1, level=0)
@@ -139,8 +162,8 @@ class Backtest:
 
         meta_df['spread_ret'] = pair_spreads.diff().apply(lambda x: np.exp(x) - 1)
         meta_df['spread_sign'] = meta_df['spread_ret'].apply(np.sign)
-        meta_df['z_spreads'] = z_spreads.shift(1)
-        meta_df['status'] = self.score_to_status(meta_df['z_spreads'])
+        meta_df['z_spreads'] = z_spreads
+        meta_df['status'] = Backtest.score_to_status(meta_df['z_spreads'])
         meta_df['label'] = np.where(meta_df['spread_sign'] == meta_df['status'], 1, 0)
 
         meta_df.drop(columns=['spread_ret', 'spread_sign'],
@@ -150,7 +173,8 @@ class Backtest:
 
         return meta_df
 
-    def get_meta_labels(self, meta_df, test_lkbk, n_splits=4):
+    @staticmethod
+    def get_meta_labels(meta_df, test_lkbk, n_splits=4):
 
         train_meta = meta_df.iloc[:-test_lkbk]
         test_meta = meta_df.iloc[-test_lkbk:]
@@ -172,17 +196,19 @@ class Backtest:
 
         return ensemble_pred
 
-    def spread_return_bg1(self, log_prices, h_ratio, position, tickers):
-        return position.multiply(((1 / h_ratio).multiply(log_prices[tickers[0]], axis=0) -\
-                                  log_prices[tickers[1]]).diff(), axis=0)
+    @staticmethod
+    def spread_return_bg1(log_prices, h_ratio, position, tickers):
+        return position.multiply(((1 / h_ratio).multiply(log_prices[tickers[0]].diff(), axis=0) - \
+                                  log_prices[tickers[1]].diff()), axis=0)
 
-    def spread_return_bl1(self, log_prices, h_ratio, position, tickers):
-        return position.multiply((log_prices[tickers[0]] - h_ratio. \
-                                  multiply(log_prices[tickers[1]], axis=0)).diff(), axis=0)
+    @staticmethod
+    def spread_return_bl1(log_prices, h_ratio, position, tickers):
+        return position.multiply((log_prices[tickers[0]].diff() - h_ratio. \
+                                  multiply(log_prices[tickers[1]].diff(), axis=0)), axis=0)
 
-    def get_strat_ret(self, pair_df, z_spreads,
-                      meta_labels, h_ratio, dev=1.5,
-                      stop_long=0.50, stop_short=0.75):
+    @staticmethod
+    def get_strat_ret(pair_df, z_spreads, meta_labels, h_ratio,
+                      dev=1.5, stop_long=0.50, stop_short=0.75):
 
         test_df = pd.DataFrame()
         pair_ids = pair_df.columns
@@ -190,25 +216,25 @@ class Backtest:
         test_df['z_spreads'] = z_spreads
         test_df['h_ratio'] = h_ratio
 
-        test_df['status'] = self.score_to_status(test_df['z_spreads'],
+        test_df['status'] = Backtest.score_to_status(test_df['z_spreads'],
                                                  dev, stop_long, stop_short)
-        test_df['status'] = test_df['status'].shift(1)
         meta_labels['meta_label'] = np.where(meta_labels['meta_label'] > 0.50, 1, 0)
         test_df['status'] = test_df['status'].\
                 multiply(meta_labels['meta_label'].squeeze(), axis=0)
 
-        test_df['dn_bool'] = test_df['h_ratio'] > 1.0
+        test_df['dn_bool'] = np.abs(test_df['h_ratio']) > 1.0
         test_df['strat_rets'] = 0.0
         test_df.loc[test_df['dn_bool'], 'strat_rets'] = \
-            self.spread_return_bg1(test_df[pair_ids],
+            Backtest.spread_return_bg1(test_df[pair_ids],
                                    test_df['h_ratio'],
                                    test_df['status'],
                                    pair_ids)
 
         test_df.loc[~test_df['dn_bool'], 'strat_rets'] = \
-            self.spread_return_bl1(test_df[pair_ids],
+            Backtest.spread_return_bl1(test_df[pair_ids],
                                    test_df['h_ratio'],
                                    test_df['status'],
                                    pair_ids)
 
-        return test_df['strat_rets'].apply(lambda x: np.exp(x) - 1)
+        return test_df['strat_rets']
+            #.apply(lambda x: np.exp(x) - 1)

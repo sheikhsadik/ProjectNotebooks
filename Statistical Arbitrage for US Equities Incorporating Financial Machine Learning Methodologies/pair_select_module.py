@@ -20,6 +20,7 @@ class PairSelect:
 
         self.selected_pairs = []
         self.hedge_weights_dict = {}
+        self.spreads_dict = {}
         self.z_spreads_dict = {}
         self.pcorr_clust_rank = pd.DataFrame()
 
@@ -42,9 +43,9 @@ class PairSelect:
             else: return []
         else: return []
 
-    def form_pairs(self, corr_thresh=0.10, hr_method='tls'):
+    def form_pairs(self, corr_thresh=0.10, hr_method='tls', max_pairs=20):
 
-        pcorr_clust, self.pcorr_clust_rank = self.get_cluster_glasso(corr_thresh=corr_thresh)
+        _, self.pcorr_clust_rank = self.get_cluster_glasso(corr_thresh=corr_thresh)
 
         for cluster in self.pcorr_clust_rank.keys():
 
@@ -68,7 +69,10 @@ class PairSelect:
                     except:
                         continue
                     if test:
+                        self.spreads_dict['{}_{}'.format(y_id, X_id)] = spreads.copy()/1e3
                         self.z_spreads_dict['{}_{}'.format(y_id, X_id)] = spread_m.get_ewm_zscore(self.spread_lkbk)
                         self.hedge_weights_dict['{}_{}'.format(y_id, X_id)] = hedge_weights.copy()
                         self.selected_pairs.append(test)
+        if len(self.selected_pairs) > max_pairs:
+            self.selected_pairs = self.selected_pairs[:max_pairs]
 
